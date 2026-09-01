@@ -1,0 +1,204 @@
+name: Set project item defaults
+
+on:
+  issues:
+    types: [opened]
+  workflow_dispatch:
+    inputs:
+      issue_number:
+        description: Issue number to update
+        required: true
+        default: "1"
+
+permissions:
+  contents: read
+  issues: read
+
+jobs:
+  set-defaults:
+    name: Estimate 1 and current iteration
+    runs-on: ubuntu-latest
+    steps:
+      - name: Set project fields
+        uses: actions/github-script@v8
+        env:
+          PROJECT_OWNER: GoodrichDev
+          PROJECT_TITLE: Project Board
+          ESTIMATE_FIELD: Estimate
+          ITERATION_FIELD: Iteration
+        with:
+          github-token: ${{ secrets.PROJECTS_TOKEN }}
+          script: |
+            const owner = process.env.PROJECT_OWNER;
+            const projectTitle = process.env.PROJECT_TITLE;
+            const estimateFieldName = process.env.ESTIMATE_FIELD;
+            const iterationFieldName = process.env.ITERATION_FIELD;
+            const issueNumber = context.eventName === "workflow_dispatch"
+              ? Number(context.payload.inputs.issue_number)
+              : context.issue.number;
+
+            if (!Number.isInteger(issueNumber) || issueNumber < 1) {
+              core.setFailed(`Invalid issue number: ${issueNumber}`);
+              return;
+            }
+
+            const projectData = await github.graphql(`
+              query($login: String!) {
+                user(login: $login) {
+                  projectsV2(first: 100) {
+                    nodes {
+                      id
+                      number
+                      title
+                      fields(first: 100) {
+                        nodes {
+                          ... on ProjectV2Field {
+                            id
+                            name
+                          }
+                          ... on ProjectV2IterationField {
+                            id
+                            name
+                            configuration {
+                              iterations {
+                                id
+                                title
+                                startDate
+                                duration
+                              }
+                              completedIterations {
+                                id
+                                title
+                                startDate
+                                duration
+                              }
+                            }
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            `, { login: owner });
+
+            const projects = projectData.user?.projectsV2?.nodes ?? [];
+            const project = projects.find(candidate => candidate.title === projectTitle);
+            if (!project) {
+              core.setFailed(`Project "${projectTitle}" was not found for ${owner}.`);
+              return;
+            }
+
+            const fields = project.fields.nodes;
+            const estimateField = fields.find(field => field?.name === estimateFieldName);
+            const iterationField = fields.find(field => field?.name === iterationFieldName);
+            if (!estimateField) {
+              core.setFailed(`Field "${estimateFieldName}" was not found.`);
+              return;
+            }
+            if (!iterationField?.configuration) {
+              core.setFailed(`Iteration field "${iterationFieldName}" was not found.`);
+              return;
+            }
+
+            const iterations = [
+              ...(iterationField.configuration.iterations ?? []),
+              ...(iterationField.configuration.completedIterations ?? []),
+            ];
+            const today = new Date();
+            today.setUTCHours(0, 0, 0, 0);
+            const currentIteration = iterations.find(iteration => {
+              const start = new Date(`${iteration.startDate}T00:00:00Z`);
+              const end = new Date(start);
+              end.setUTCDate(end.getUTCDate() + iteration.duration);
+              return start <= today && today < end;
+            });
+
+            if (!currentIteration) {
+              core.setFailed(`No active iteration exists for ${today.toISOString().slice(0, 10)}.`);
+              return;
+            }
+
+            const issueData = await github.graphql(`
+              query($owner: String!, $repo: String!, $number: Int!) {
+                repository(owner: $owner, name: $repo) {
+                  issue(number: $number) {
+                    id
+                    projectItems(first: 100) {
+                      nodes {
+                        id
+                        project {
+                          id
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            `, {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              number: issueNumber,
+            });
+
+            const issue = issueData.repository?.issue;
+            if (!issue) {
+              core.setFailed(`Issue #${issueNumber} was not found.`);
+              return;
+            }
+
+            let item = issue.projectItems.nodes.find(candidate => candidate.project.id === project.id);
+            if (!item) {
+              const added = await github.graphql(`
+                mutation($projectId: ID!, $contentId: ID!) {
+                  addProjectV2ItemById(input: {
+                    projectId: $projectId
+                    contentId: $contentId
+                  }) {
+                    item {
+                      id
+                    }
+                  }
+                }
+              `, { projectId: project.id, contentId: issue.id });
+              item = added.addProjectV2ItemById.item;
+            }
+
+            await github.graphql(`
+              mutation(
+                $projectId: ID!
+                $itemId: ID!
+                $estimateFieldId: ID!
+                $estimate: Float!
+                $iterationFieldId: ID!
+                $iterationId: String!
+              ) {
+                estimate: updateProjectV2ItemFieldValue(input: {
+                  projectId: $projectId
+                  itemId: $itemId
+                  fieldId: $estimateFieldId
+                  value: { number: $estimate }
+                }) {
+                  projectV2Item { id }
+                }
+                iteration: updateProjectV2ItemFieldValue(input: {
+                  projectId: $projectId
+                  itemId: $itemId
+                  fieldId: $iterationFieldId
+                  value: { iterationId: $iterationId }
+                }) {
+                  projectV2Item { id }
+                }
+              }
+            `, {
+              projectId: project.id,
+              itemId: item.id,
+              estimateFieldId: estimateField.id,
+              estimate: 1,
+              iterationFieldId: iterationField.id,
+              iterationId: currentIteration.id,
+            });
+
+            core.notice(
+              `Issue #${issueNumber}: Estimate=1, Iteration=${currentIteration.title}`
+            );
